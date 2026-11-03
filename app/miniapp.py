@@ -140,6 +140,12 @@ class IncomingProduct(Base):
     source_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class AutomaticIphone(Base):
+    # A marker prevents an explicit later rejection from being undone by a replay.
+    __tablename__ = 'automatic_iphone_products'
+    product_id: Mapped[int] = mapped_column(ForeignKey('products.id'), primary_key=True)
+
+
 AUTO_CATEGORIES = {'Смартфоны', 'Планшеты', 'Ноутбуки', 'Умные часы', 'Наушники',
                    'Умные кольца', 'Микрофоны', 'Веб-камеры', 'Игровые приставки',
                    'Очки', 'Камеры', 'Портативные электростанции', 'Уход за волосами',
@@ -195,7 +201,12 @@ def stage_incoming_product(account, chat_id, message, now=None):
                     message_id=message.id, stored_message_id=row.id, line=imported.line,
                     message_hash=fingerprint, source_price=imported.cost, source_at=stamp))
         db.commit()
-        for candidate in parsed['candidates']:
+        # HI's documented abbreviated iPhone format is accepted only from that
+        # resolved Telegram peer, and only with an explicit, unambiguous SIM.
+        candidates = list(parsed['candidates'])
+        if source.is_hi_catalog:
+            candidates += [r['possible_iphone'] for r in parsed['needs_review'] if r.get('possible_iphone')]
+        for candidate in candidates:
             if candidate['category'] not in AUTO_CATEGORIES or len(candidate['model']) > 200:
                 continue
             cost = Decimal(candidate['cost'])
@@ -209,9 +220,7 @@ def stage_incoming_product(account, chat_id, message, now=None):
             existing = db.scalar(select(IncomingProduct).where(IncomingProduct.account == account,
                 IncomingProduct.chat_id == chat_id, IncomingProduct.message_id == message.id,
                 IncomingProduct.line == candidate['line'], IncomingProduct.message_hash == fingerprint))
-            if existing:
-                continue
-            for attempt in range(2):
+            for attempt in range(2) if not existing else ():
                 try:
                     with db.begin_nested():
                         product = db.scalar(select(Product).where(Product.sku_key == sku))
@@ -229,6 +238,101 @@ def stage_incoming_product(account, chat_id, message, now=None):
                         raise
             # Commit each entry so retries cannot discard earlier valid products.
             db.commit()
+            if _automatic_iphone_candidate(candidate):
+                _apply_automatic_iphone(db, account, chat_id, message.id, candidate, fingerprint, now)
+
+
+def _automatic_iphone_candidate(candidate):
+    """Match only an explicit iPhone generation, storage and one known SIM type."""
+    return (candidate['brand'] == 'Apple' and candidate['category'] == 'Смартфоны'
+            and candidate['sim'] in {'eSIM', 'SIM + eSIM', '2 SIM', '1 SIM'}
+            and bool(re.match(r'^iPhone\s+1[3-8](?:[eе])?(?:\s+(?:pro(?:\s+max)?|plus|air))?\s+(?:128|256|512|1\s*tb|2\s*tb)\b',
+                              candidate['model'], re.I)))
+
+
+def _apply_automatic_iphone(db, account, chat_id, message_id, candidate, fingerprint, now):
+    """Apply a fresh exact source line; never infer absence or overwrite newer data."""
+    source = db.scalar(select(SupplierSource).where(SupplierSource.account == account,
+                       SupplierSource.chat_id == chat_id).with_for_update())
+    message = db.scalar(select(SupplierMessage).where(SupplierMessage.account == account,
+                        SupplierMessage.chat_id == chat_id, SupplierMessage.message_id == message_id).with_for_update())
+    if not source or not message or not hmac.compare_digest(hashlib.sha256(message.text.encode('utf-8')).hexdigest(), fingerprint):
+        db.rollback()
+        return
+    incoming = db.scalar(select(IncomingProduct).where(IncomingProduct.account == account,
+        IncomingProduct.chat_id == chat_id, IncomingProduct.message_id == message_id,
+        IncomingProduct.line == candidate['line'], IncomingProduct.message_hash == fingerprint))
+    if not incoming:
+        db.rollback()
+        return
+    source_at = incoming.source_at
+    if source_at.tzinfo is None:
+        source_at = source_at.replace(tzinfo=timezone.utc)
+    if source_at > now or source_at.astimezone(ZoneInfo('Europe/Moscow')).date() != now.astimezone(ZoneInfo('Europe/Moscow')).date():
+        db.rollback()
+        return
+    latest = db.scalar(select(IncomingProduct).where(IncomingProduct.account == account,
+        IncomingProduct.chat_id == chat_id, IncomingProduct.product_id == incoming.product_id)
+        .order_by(IncomingProduct.source_at.desc(), IncomingProduct.id.desc()).limit(1))
+    if not latest or latest.id != incoming.id:
+        db.rollback()
+        return
+    product = db.scalar(select(Product).where(Product.id == incoming.product_id).with_for_update())
+    if not product or product.hidden:
+        db.rollback()
+        return
+    binding = db.scalar(select(SupplierSourceBinding).where(SupplierSourceBinding.account == account,
+                        SupplierSourceBinding.chat_id == chat_id))
+    if not binding:
+        previous = db.scalars(select(OfferImport.supplier_id).where(OfferImport.account == account,
+                              OfferImport.chat_id == chat_id).distinct().limit(2)).all()
+        if len(previous) > 1:
+            db.rollback()
+            return
+        supplier = db.get(Supplier, previous[0]) if previous else None
+        if previous and not supplier:
+            db.rollback()
+            return
+        if not supplier:
+            source_name = f'Telegram {account}:{chat_id}'
+            supplier = db.scalar(select(Supplier).where(Supplier.name == source_name))
+            if not supplier:
+                supplier = Supplier(name=source_name)
+                db.add(supplier)
+                db.flush()
+        binding = SupplierSourceBinding(account=account, chat_id=chat_id, supplier_id=supplier.id)
+        db.add(binding)
+        db.flush()
+    other_binding = db.scalar(select(SupplierSourceBinding.id).where(
+        SupplierSourceBinding.supplier_id == binding.supplier_id,
+        SupplierSourceBinding.id != binding.id).limit(1))
+    if other_binding:
+        db.rollback()
+        return
+    marker = db.get(AutomaticIphone, product.id)
+    if marker and not product.approved:
+        db.rollback()
+        return
+    if not marker:
+        db.add(AutomaticIphone(product_id=product.id))
+        product.approved = True
+    imported = db.scalar(select(OfferImport.id).where(OfferImport.account == account,
+        OfferImport.chat_id == chat_id, OfferImport.message_id == message_id,
+        OfferImport.line == candidate['line'], OfferImport.message_hash == fingerprint,
+        OfferImport.product_id == product.id, OfferImport.supplier_id == binding.supplier_id))
+    if not imported:
+        offer = db.scalar(select(Offer).where(Offer.product_id == product.id,
+                          Offer.supplier_id == binding.supplier_id).with_for_update())
+        if offer is None:
+            offer = Offer(product_id=product.id, supplier_id=binding.supplier_id)
+            db.add(offer)
+        offer.cost = incoming.source_price
+        offer.confirmed_date = source_at.astimezone(ZoneInfo('Europe/Moscow')).date().isoformat()
+        offer.active = True
+        db.add(OfferImport(supplier_id=binding.supplier_id, product_id=product.id, account=account,
+               chat_id=chat_id, message_id=message_id, line=candidate['line'], message_hash=fingerprint,
+               cost=incoming.source_price, imported_at=now))
+    db.commit()
 
 
 class CatalogDestination(Base):

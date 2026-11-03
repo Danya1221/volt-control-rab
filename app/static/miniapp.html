@@ -182,7 +182,7 @@ async function loadReviews(){
  const [items,sources]=await Promise.all([api('/products'),api('/product-sources')]), root=document.getElementById('reviews');root.replaceChildren();
  const pending=items.filter(p=>!p.approved||sources.some(s=>s.product_id===p.id));
  if(!pending.length){root.append(el('p','Очередь пуста.','muted'));return}
- root.append(el('p','Новые распознанные товары добавляются на проверку. Цены из сообщений не подтверждены и не используются автоматически.','muted'));
+ root.append(el('p','iPhone с однозначной моделью, памятью и SIM обрабатываются автоматически. Остальные товары и спорные позиции остаются на проверке.','muted'));
  for(const p of pending){const d=el('details');d.append(el('summary',p.model),el('p','Категория: '+p.category+(p.category==='Смартфоны'?' · SIM: '+(p.sim||'не указана'):' '),'muted'));
  const found=sources.filter(s=>s.product_id===p.id);
  if(!found.length)d.append(el('p','Сверьте товар с исходным сообщением в разделе «Поставщики».','muted'));

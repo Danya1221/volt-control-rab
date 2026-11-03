@@ -67,6 +67,18 @@ def test_import_on_disposable_postgres(monkeypatch):
             db.add(miniapp.CatalogTopicRule(chat_id=-10099,brand='Apple',category='Смартфоны',brand_key='apple',category_key='смартфоны',product_id=0,thread_id=17))
             db.commit()
             assert miniapp.topic_for_product(db,-10099,'Apple','Смартфоны').thread_id == 17
+            db.scalar(select(SupplierSource).where(SupplierSource.chat_id == 12345678901)).is_hi_catalog = True
+            db.commit()
+        stamp = datetime.now(timezone.utc)
+        phone = SimpleNamespace(id=52, raw_text='17 Pro 256 Silver (eSIM) - 99000', date=stamp, edit_date=None, out=False)
+        persist(db_factory, 'miniapp-111', 12345678901, phone)
+        miniapp.stage_incoming_product('miniapp-111', 12345678901, phone, stamp)
+        miniapp.stage_incoming_product('miniapp-111', 12345678901, phone, stamp)
+        with db_factory() as db:
+            auto = db.scalar(select(main.Product).where(main.Product.model.like('iPhone 17 Pro 256%')))
+            assert auto.approved
+            assert db.scalar(select(main.Offer).where(main.Offer.product_id == auto.id)).cost == 99000
+            assert len(db.scalars(select(miniapp.OfferImport).where(miniapp.OfferImport.product_id == auto.id)).all()) == 1
     finally:
         CollectorBase.metadata.drop_all(engine)
         main.Base.metadata.drop_all(engine)
