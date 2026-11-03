@@ -26,6 +26,8 @@ def test_import_on_disposable_postgres(monkeypatch):
     CollectorBase.metadata.create_all(engine)
     db_factory = sessionmaker(engine)
     monkeypatch.setattr(miniapp, 'Sessions', db_factory)
+    automatic_candidate = miniapp._automatic_product_candidate
+    monkeypatch.setattr(miniapp, '_automatic_product_candidate', lambda candidate: False)
     try:
         with db_factory() as db:
             db.add(miniapp.ReaderAccount(slot=1, telegram_id='111', display_name='Test', encrypted_session='unused', chats_json='[]'))
@@ -69,6 +71,7 @@ def test_import_on_disposable_postgres(monkeypatch):
             assert miniapp.topic_for_product(db,-10099,'Apple','Смартфоны').thread_id == 17
             db.scalar(select(SupplierSource).where(SupplierSource.chat_id == 12345678901)).is_hi_catalog = True
             db.commit()
+        monkeypatch.setattr(miniapp, '_automatic_product_candidate', automatic_candidate)
         stamp = datetime.now(timezone.utc)
         phone = SimpleNamespace(id=52, raw_text='17 Pro 256 Silver (eSIM) - 99000', date=stamp, edit_date=None, out=False)
         persist(db_factory, 'miniapp-111', 12345678901, phone)
@@ -79,6 +82,15 @@ def test_import_on_disposable_postgres(monkeypatch):
             assert auto.approved
             assert db.scalar(select(main.Offer).where(main.Offer.product_id == auto.id)).cost == 99000
             assert len(db.scalars(select(miniapp.OfferImport).where(miniapp.OfferImport.product_id == auto.id)).all()) == 1
+        watch = SimpleNamespace(id=53, raw_text='S10 46 Silver (M/L) 🇺🇸 - 23500', date=stamp, edit_date=None, out=False)
+        persist(db_factory, 'miniapp-111', 12345678901, watch)
+        miniapp.stage_incoming_product('miniapp-111', 12345678901, watch, stamp)
+        with db_factory() as db:
+            auto = db.scalar(select(main.Product).where(main.Product.model.like('Apple Watch S10%')))
+            assert auto.approved
+            assert db.scalar(select(main.Offer).where(main.Offer.product_id == auto.id)).cost == 23500
+        sources = miniapp.message_sources(1)['sources']
+        assert len(sources) == 1 and sources[0]['count'] == 4
     finally:
         CollectorBase.metadata.drop_all(engine)
         main.Base.metadata.drop_all(engine)

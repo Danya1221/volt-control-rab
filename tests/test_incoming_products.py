@@ -47,10 +47,10 @@ def test_automatic_staging_is_idempotent_and_filters_hi_android(monkeypatch):
         assert len(products)==2
         phone = next(p for p in products if p.category == 'Смартфоны')
         headphones = next(p for p in products if p.category == 'Наушники')
-        assert phone.approved and not headphones.approved
+        assert phone.approved and headphones.approved
         assert len(session.scalars(select(miniapp.IncomingProduct)).all())==2
         assert len(session.scalars(select(Supplier)).all())==1
-        assert session.scalar(select(Offer)).product_id == phone.id
+        assert {o.product_id for o in session.scalars(select(Offer)).all()} == {phone.id, headphones.id}
     other=msg(2,'🎧AirPods 5 - 10600',now-timedelta(days=1))
     outgoing=msg(3,'🎧AirPods 5 - 10600',now,out=True)
     unknown=msg(4,'🎧AirPods 5 - 10600',now)
@@ -63,6 +63,7 @@ def test_automatic_staging_is_idempotent_and_filters_hi_android(monkeypatch):
 
 
 def test_incoming_source_exposed_only_to_owner_and_confirmed_explicitly(monkeypatch):
+    monkeypatch.setattr(miniapp, '_automatic_product_candidate', lambda candidate: False)
     engine, db=setup(monkeypatch)
     now=datetime.now(timezone.utc)
     m=msg(10,'🎧AirPods 4 - 8400',now)
@@ -159,6 +160,7 @@ def test_prior_manual_import_recovers_provenance_only_from_actual_message(monkey
 
 
 def test_repeated_messages_latest_only_and_source_bound_without_typing(monkeypatch):
+    monkeypatch.setattr(miniapp, '_automatic_product_candidate', lambda candidate: False)
     from app.main import Supplier
     engine, db = setup(monkeypatch)
     now=datetime.now(timezone.utc)
@@ -183,6 +185,7 @@ def test_repeated_messages_latest_only_and_source_bound_without_typing(monkeypat
 
 
 def test_stale_selection_is_rejected_and_other_sources_remain(monkeypatch):
+    monkeypatch.setattr(miniapp, '_automatic_product_candidate', lambda candidate: False)
     engine, db=setup(monkeypatch)
     now=datetime.now(timezone.utc)
     first=msg(30,'🎧AirPods 4 - 8400',now-timedelta(minutes=3))

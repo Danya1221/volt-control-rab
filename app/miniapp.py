@@ -30,8 +30,9 @@ from telethon.sessions import StringSession
 
 from app.main import Base, Sessions, Supplier, Product, Offer, Markup, ProductIn, FlagIn, AmountIn, key_for, today
 from app.main import products as list_products, approve as approve_product, hide as hide_product, markup as set_markup
-from app.integrated_collector import Base as CollectorBase, SupplierMessage, SupplierMessageTime, SupplierSource, monitor_account, NoAccessibleChats
+from app.integrated_collector import Base as CollectorBase, SupplierMessage, SupplierMessageTime, SupplierSource, SupplierSourceInfo, monitor_account, NoAccessibleChats
 from app.price_parser import parse_lines
+from app.product_lexicon import normalize_product_name
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix='/miniapp/api', dependencies=[])
@@ -101,7 +102,7 @@ async def guarded_monitor(slot, data, config):
 
 
 class OfferImport(Base):
-    """Trace each explicitly reviewed import back to its captured message."""
+    """Trace each applied offer back to its captured message."""
     __tablename__ = 'reviewed_offer_imports'
     id: Mapped[int] = mapped_column(primary_key=True)
     supplier_id: Mapped[int] = mapped_column(ForeignKey('suppliers.id'))
@@ -141,8 +142,14 @@ class IncomingProduct(Base):
 
 
 class AutomaticIphone(Base):
-    # A marker prevents an explicit later rejection from being undone by a replay.
+    # Retain the previous iPhone marker so a later rejection stays rejected.
     __tablename__ = 'automatic_iphone_products'
+    product_id: Mapped[int] = mapped_column(ForeignKey('products.id'), primary_key=True)
+
+
+class AutomaticProduct(Base):
+    # Never re-approve a product that an owner later rejects.
+    __tablename__ = 'automatic_products'
     product_id: Mapped[int] = mapped_column(ForeignKey('products.id'), primary_key=True)
 
 
@@ -154,10 +161,7 @@ AUTO_CATEGORIES = {'Смартфоны', 'Планшеты', 'Ноутбуки',
 
 
 def stage_incoming_product(account, chat_id, message, now=None):
-    """Add only recognised current-day incoming products to the review queue.
-
-    Prices remain unconfirmed and no supplier or offer is created here.
-    """
+    """Stage current incoming items and apply unambiguous source-backed prices."""
     if getattr(message, 'out', False) or not getattr(message, 'date', None):
         return
     stamp = getattr(message, 'edit_date', None) or message.date
@@ -238,19 +242,32 @@ def stage_incoming_product(account, chat_id, message, now=None):
                         raise
             # Commit each entry so retries cannot discard earlier valid products.
             db.commit()
-            if _automatic_iphone_candidate(candidate):
-                _apply_automatic_iphone(db, account, chat_id, message.id, candidate, fingerprint, now)
+            if _automatic_product_candidate(candidate):
+                _apply_automatic_product(db, account, chat_id, message.id, candidate, fingerprint, now)
 
 
-def _automatic_iphone_candidate(candidate):
-    """Match only an explicit iPhone generation, storage and one known SIM type."""
-    return (candidate['brand'] == 'Apple' and candidate['category'] == 'Смартфоны'
-            and candidate['sim'] in {'eSIM', 'SIM + eSIM', '2 SIM', '1 SIM'}
-            and bool(re.match(r'^iPhone\s+1[3-8](?:[eе])?(?:\s+(?:pro(?:\s+max)?|plus|air))?\s+(?:128|256|512|1\s*tb|2\s*tb)\b',
-                              candidate['model'], re.I)))
+def _automatic_product_candidate(candidate):
+    """Accept recognised exact supplier labels, not uncertain parser results."""
+    if candidate['category'] == 'Смартфоны':
+        # Storage and SIM must be explicit; HI's Android filter runs in parse_lines.
+        model = normalize_product_name(candidate['model'])
+        if candidate['sim'] not in {'eSIM', 'SIM + eSIM', '2 SIM', '1 SIM'}:
+            return False
+        if not re.search(r'(?<!\d)(?:64|128|256|512|1024|2048)(?!\d)|\b[12]\s*tb\b', model, re.I):
+            return False
+        if candidate['brand'] == 'Apple':
+            return bool(re.search(r'\biphone\s+(?:\d{1,2}[a-zе]?|se\s*\d*)\b', model, re.I))
+        return bool(re.search(r'\d', model))
+    # A number supplies an explicit model, series or version, so a bare family
+    # such as "AirPods Pro" does not silently stand for multiple generations.
+    if not re.search(r'\d', candidate['model']):
+        return False
+    if candidate['brand'] == 'Apple' and candidate['category'] == 'Умные часы':
+        return bool(re.search(r'\b(?:se\s*\d+|s\s*\d+|series\s*\d+|ul(?:tra)?\s*\d+)\b', candidate['model'], re.I))
+    return candidate['category'] in AUTO_CATEGORIES
 
 
-def _apply_automatic_iphone(db, account, chat_id, message_id, candidate, fingerprint, now):
+def _apply_automatic_product(db, account, chat_id, message_id, candidate, fingerprint, now):
     """Apply a fresh exact source line; never infer absence or overwrite newer data."""
     source = db.scalar(select(SupplierSource).where(SupplierSource.account == account,
                        SupplierSource.chat_id == chat_id).with_for_update())
@@ -309,12 +326,12 @@ def _apply_automatic_iphone(db, account, chat_id, message_id, candidate, fingerp
     if other_binding:
         db.rollback()
         return
-    marker = db.get(AutomaticIphone, product.id)
+    marker = db.get(AutomaticProduct, product.id) or db.get(AutomaticIphone, product.id)
     if marker and not product.approved:
         db.rollback()
         return
     if not marker:
-        db.add(AutomaticIphone(product_id=product.id))
+        db.add(AutomaticProduct(product_id=product.id))
         product.approved = True
     imported = db.scalar(select(OfferImport.id).where(OfferImport.account == account,
         OfferImport.chat_id == chat_id, OfferImport.message_id == message_id,
@@ -888,8 +905,36 @@ async def resume_reader(slot: int):
     return {'ok': True}
 
 
+@router.get('/accounts/{slot}/message-sources', dependencies=[Depends(owner)])
+def message_sources(slot: int):
+    """Group saved messages by the actual Telegram peer, within one account."""
+    validate_slot(slot)
+    account = saved(slot)
+    if not account:
+        raise HTTPException(404, 'Сначала подключите аккаунт')
+    account_key = f"miniapp-{account['telegram_id']}"
+    with Sessions() as db:
+        rows = db.execute(select(SupplierMessage.chat_id, func.count(SupplierMessage.id),
+                          func.max(SupplierMessage.seen_at)).where(SupplierMessage.account == account_key)
+                          .group_by(SupplierMessage.chat_id).order_by(func.max(SupplierMessage.seen_at).desc())).all()
+        infos = {x.chat_id: x for x in db.scalars(select(SupplierSourceInfo).where(SupplierSourceInfo.account == account_key))}
+        hi = {x.chat_id for x in db.scalars(select(SupplierSource).where(SupplierSource.account == account_key,
+                                                                            SupplierSource.is_hi_catalog.is_(True)))}
+        result = []
+        for chat_id, count, last in rows:
+            info = infos.get(chat_id)
+            username = info.username if info else ''
+            title = info.title if info else ''
+            if not username and chat_id in hi:
+                username = 'hi_catalog_bot'
+            label = title + (' · @' + username if username else '') if title else ('@' + username if username else 'Чат ' + str(chat_id))
+            result.append({'chat_id': str(chat_id), 'label': label, 'count': count,
+                           'last_seen_at': last.isoformat() if last else None})
+        return {'sources': result}
+
+
 @router.get('/accounts/{slot}/messages', dependencies=[Depends(owner)])
-def account_messages(slot: int, before: int | None = None):
+def account_messages(slot: int, before: int | None = None, chat_id: int | None = None):
     """Show saved messages only; never fetch, send or apply prices here."""
     validate_slot(slot)
     account = saved(slot)
@@ -899,6 +944,10 @@ def account_messages(slot: int, before: int | None = None):
         query = select(SupplierMessage).where(
             SupplierMessage.account == f"miniapp-{account['telegram_id']}"
         )
+        if chat_id is not None:
+            if not -(2**63) <= chat_id < 2**63:
+                raise HTTPException(422, 'Некорректный ID чата')
+            query = query.where(SupplierMessage.chat_id == chat_id)
         if before is not None:
             query = query.where(SupplierMessage.id < before)
         rows = db.scalars(query.order_by(SupplierMessage.id.desc()).limit(21)).all()

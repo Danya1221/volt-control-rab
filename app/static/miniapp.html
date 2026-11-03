@@ -64,10 +64,22 @@ const labels={not_configured:'Чаты не настроены',connecting:'По
 async function showQR(slot,panel,reconnect){const r=await api('/accounts/'+slot+(reconnect?'/reconnect':'/login'),{method:'POST'});panel.replaceChildren();panel.append(el('p','На другом устройстве в том же аккаунте Telegram откройте Настройки → Устройства → Подключить устройство и отсканируйте QR-код. Чаты и сообщения сохранятся.','muted'));let img=el('img');img.src='data:image/png;base64,'+r.qr_image;img.alt='QR-код входа в Telegram';panel.append(img);watch(slot,panel)}
 async function refresh(){const items=await api('/accounts');root.replaceChildren();for(const a of items){const card=el('section',undefined,'card');card.append(el('h2','Аккаунт '+a.slot),el('div',a.connected?'Подключён: '+a.name:'Не подключён','status'));
 if(!a.connected){let panel=el('div');card.append(btn('Подключить через QR',async()=>{await showQR(a.slot,panel,false)},'secondary'),panel)}else{
-card.append(el('p',labels[a.monitor]||a.monitor,'muted'));const md=a.monitor_details||{};const reasons={chats_unavailable:'Нет доступа к указанным чатам. Проверьте адреса и доступ этого аккаунта.',telegram_limit:'Telegram временно ограничил запросы. Повторим попытку.',session_invalid:'Telegram отклонил сессию. Может потребоваться повторное подключение аккаунта.',database:'Не удалось сохранить данные. Проверьте подключение базы.',network:'Нет соединения с Telegram или базой. Повторим попытку.',unknown:'Причина пока не определена. Проверьте журнал Railway.'};if(md.reason)card.append(el('p',(reasons[md.reason]||reasons.unknown)+(md.error_type?' Код: '+md.error_type:''),'error'));if(md.inaccessible_chats?.length)card.append(el('p','Не удалось открыть: '+md.inaccessible_chats.join(', ')+'. Проверьте адреса и доступ этого аккаунта.','error'));if(a.monitor==='paused')card.append(btn('Возобновить мониторинг',async()=>{await api('/accounts/'+a.slot+'/resume',{method:'POST'});await refresh()}));let reconnectPanel=el('div');card.append(btn('Переподключить через QR',async()=>{await showQR(a.slot,reconnectPanel,true)},'secondary'),reconnectPanel);card.append(el('div','Чаты и каналы для отслеживания','label'));let textarea=el('textarea');textarea.placeholder='@channel_name или числовой ID, по одному на строке';textarea.value=a.chats.join('\n');card.append(textarea,btn('Сохранить чаты',async()=>{let chats=textarea.value.split(/\n/).map(x=>x.trim()).filter(Boolean);await api('/accounts/'+a.slot+'/chats',{method:'PUT',body:JSON.stringify({chats})});await refresh()}),btn('Отключить аккаунт',async()=>{if(!confirm('Отключить аккаунт от VOLT Control? Сохранённые сообщения останутся в базе.'))return;await api('/accounts/'+a.slot,{method:'DELETE'});await refresh()},'danger'));let inbox=el('div');card.append(btn('Показать сообщения',async()=>{inbox.replaceChildren();await loadMessages(a.slot,inbox)},'secondary'),inbox)}
+card.append(el('p',labels[a.monitor]||a.monitor,'muted'));const md=a.monitor_details||{};const reasons={chats_unavailable:'Нет доступа к указанным чатам. Проверьте адреса и доступ этого аккаунта.',telegram_limit:'Telegram временно ограничил запросы. Повторим попытку.',session_invalid:'Telegram отклонил сессию. Может потребоваться повторное подключение аккаунта.',database:'Не удалось сохранить данные. Проверьте подключение базы.',network:'Нет соединения с Telegram или базой. Повторим попытку.',unknown:'Причина пока не определена. Проверьте журнал Railway.'};if(md.reason)card.append(el('p',(reasons[md.reason]||reasons.unknown)+(md.error_type?' Код: '+md.error_type:''),'error'));if(md.inaccessible_chats?.length)card.append(el('p','Не удалось открыть: '+md.inaccessible_chats.join(', ')+'. Проверьте адреса и доступ этого аккаунта.','error'));if(a.monitor==='paused')card.append(btn('Возобновить мониторинг',async()=>{await api('/accounts/'+a.slot+'/resume',{method:'POST'});await refresh()}));let reconnectPanel=el('div');card.append(btn('Переподключить через QR',async()=>{await showQR(a.slot,reconnectPanel,true)},'secondary'),reconnectPanel);card.append(el('div','Чаты и каналы для отслеживания','label'));let textarea=el('textarea');textarea.placeholder='@channel_name или числовой ID, по одному на строке';textarea.value=a.chats.join('\n');card.append(textarea,btn('Сохранить чаты',async()=>{let chats=textarea.value.split(/\n/).map(x=>x.trim()).filter(Boolean);await api('/accounts/'+a.slot+'/chats',{method:'PUT',body:JSON.stringify({chats})});await refresh()}),btn('Отключить аккаунт',async()=>{if(!confirm('Отключить аккаунт от VOLT Control? Сохранённые сообщения останутся в базе.'))return;await api('/accounts/'+a.slot,{method:'DELETE'});await refresh()},'danger'));let inbox=el('div');card.append(btn('Прайсы по источникам',async()=>{inbox.replaceChildren();await loadMessageSources(a.slot,inbox)},'secondary'),inbox)}
 root.append(card)}}
-async function loadMessages(slot, container, before=null){
-  const suffix=before?'?before='+encodeURIComponent(before):'';
+async function loadMessageSources(slot, container){
+  const data=await api('/accounts/'+slot+'/message-sources');
+  if(!data.sources.length){container.append(el('p','Сохранённых сообщений пока нет.','muted'));return}
+  container.append(el('p','Выбери источник, чтобы открыть его сообщения.','muted'));
+  for(const source of data.sources){
+    const group=el('details',undefined,'source-group');const list=el('div');let loaded=false;
+    group.append(el('summary',source.label+' · сообщений: '+source.count),list);
+    group.ontoggle=async()=>{if(!group.open || loaded)return;loaded=true;list.replaceChildren();try{await loadMessages(slot,list,null,source.chat_id)}catch(e){loaded=false;list.replaceChildren(el('p','Не удалось загрузить сообщения: '+e.message,'error'))}};
+    container.append(group);
+  }
+}
+async function loadMessages(slot, container, before=null, chatId=null){
+  const params=[];if(before)params.push('before='+encodeURIComponent(before));if(chatId!==null)params.push('chat_id='+encodeURIComponent(chatId));
+  const suffix=params.length?'?'+params.join('&'):'';
   const data=await api('/accounts/'+slot+'/messages'+suffix);
   if(!before && !data.messages.length){container.append(el('p','Сохранённых сообщений пока нет. Проверьте, что чаты сохранены и мониторинг подключился. Файлы пока не обрабатываются.','muted'));return}
   for(const m of data.messages){
@@ -101,7 +113,7 @@ async function loadMessages(slot, container, before=null){
       paged(p.needs_review,30,(section,row)=>{if(row.possible_iphone)addEntry(section,row.possible_iphone,true);else section.append(el('p','Проверить: '+row.raw+' — '+row.reason))});
     },'secondary'),result)}container.append(details)
   }
-  if(data.next_before){let more=btn('Ещё сообщения',async()=>{more.remove();await loadMessages(slot,container,data.next_before)},'secondary');container.append(more)}
+  if(data.next_before){let more=btn('Ещё сообщения',async()=>{more.remove();await loadMessages(slot,container,data.next_before,chatId)},'secondary');container.append(more)}
 }
 
 // Lists come from the live catalog and saved rules; no example products are inserted.
@@ -182,7 +194,7 @@ async function loadReviews(){
  const [items,sources]=await Promise.all([api('/products'),api('/product-sources')]), root=document.getElementById('reviews');root.replaceChildren();
  const pending=items.filter(p=>!p.approved||sources.some(s=>s.product_id===p.id));
  if(!pending.length){root.append(el('p','Очередь пуста.','muted'));return}
- root.append(el('p','iPhone с однозначной моделью, памятью и SIM обрабатываются автоматически. Остальные товары и спорные позиции остаются на проверке.','muted'));
+ root.append(el('p','Распознанные товары с указанной моделью обрабатываются автоматически. Телефоны без однозначной SIM и другие спорные позиции остаются на проверке.','muted'));
  for(const p of pending){const d=el('details');d.append(el('summary',p.model),el('p','Категория: '+p.category+(p.category==='Смартфоны'?' · SIM: '+(p.sim||'не указана'):' '),'muted'));
  const found=sources.filter(s=>s.product_id===p.id);
  if(!found.length)d.append(el('p','Сверьте товар с исходным сообщением в разделе «Поставщики».','muted'));
