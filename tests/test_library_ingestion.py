@@ -1,4 +1,4 @@
-"""Library recognition reaches the saved-product review queue, never live offers."""
+"""Recognition and processing against an isolated database."""
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -19,7 +19,7 @@ def generic_source(monkeypatch):
     return engine, factory
 
 
-def test_library_stages_nonphone_families_from_real_message_rows_without_confirming(monkeypatch):
+def test_library_stages_and_applies_explicit_nonphone_models(monkeypatch):
     engine, factory = generic_source(monkeypatch)
     now = datetime.now(timezone.utc)
     source = 'miniapp-1234'
@@ -44,15 +44,17 @@ def test_library_stages_nonphone_families_from_real_message_rows_without_confirm
             ('Meta Ray-Ban', 'Очки'), ('Insta360', 'Камеры'),
             ('Яндекс', 'Колонки'), ('Apple', 'Зарядные устройства'),
         }
-        assert all(not p.approved and not p.hidden for p in products)
+        assert all(not p.hidden for p in products)
+        assert {p.brand for p in products if p.approved} == {'Meta Ray-Ban', 'Insta360', 'Apple'}
+        assert {p.brand for p in products if not p.approved} == {'Яндекс'}
         assert {p.id for p in products} == {s.product_id for s in staged}
         assert [s.line for s in staged] == [1, 3, 5, 7]
         assert [s.source_price for s in staged] == [
             Decimal('31500'), Decimal('43500'), Decimal('7400'), Decimal('1000')]
         assert all(s.account == source and s.chat_id == 1 and s.message_id == 80 for s in staged)
         assert all(s.stored_message_id and len(s.message_hash) == 64 for s in staged)
-        assert not db.scalars(select(Offer)).all()
-        assert not db.scalars(select(Supplier)).all()
+        assert len(db.scalars(select(Offer)).all()) == 3
+        assert len(db.scalars(select(Supplier)).all()) == 1
     engine.dispose()
 
 
