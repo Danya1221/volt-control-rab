@@ -32,6 +32,7 @@ from app.main import Base, Sessions, Supplier, Product, Offer, Markup, ProductIn
 from app.main import products as list_products, approve as approve_product, hide as hide_product, markup as set_markup
 from app.integrated_collector import Base as CollectorBase, SupplierMessage, SupplierMessageTime, SupplierSource, SupplierSourceInfo, monitor_account, NoAccessibleChats
 from app.price_parser import parse_lines
+from app.product_lexicon import normalize_product_name
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix='/miniapp/api', dependencies=[])
@@ -248,11 +249,15 @@ def stage_incoming_product(account, chat_id, message, now=None):
 def _automatic_product_candidate(candidate):
     """Accept recognised exact supplier labels, not uncertain parser results."""
     if candidate['category'] == 'Смартфоны':
-        # Keep the existing stricter phone identity and explicit SIM requirement.
-        return (candidate['brand'] == 'Apple'
-                and candidate['sim'] in {'eSIM', 'SIM + eSIM', '2 SIM', '1 SIM'}
-                and bool(re.match(r'^iPhone\s+1[3-8](?:[eе])?(?:\s+(?:pro(?:\s+max)?|plus|air))?\s+(?:128|256|512|1\s*tb|2\s*tb)\b',
-                                  candidate['model'], re.I)))
+        # Storage and SIM must be explicit; HI's Android filter runs in parse_lines.
+        model = normalize_product_name(candidate['model'])
+        if candidate['sim'] not in {'eSIM', 'SIM + eSIM', '2 SIM', '1 SIM'}:
+            return False
+        if not re.search(r'(?<!\d)(?:64|128|256|512|1024|2048)(?!\d)|\b[12]\s*tb\b', model, re.I):
+            return False
+        if candidate['brand'] == 'Apple':
+            return bool(re.search(r'\biphone\s+(?:\d{1,2}[a-zе]?|se\s*\d*)\b', model, re.I))
+        return bool(re.search(r'\d', model))
     # A number supplies an explicit model, series or version, so a bare family
     # such as "AirPods Pro" does not silently stand for multiple generations.
     if not re.search(r'\d', candidate['model']):
