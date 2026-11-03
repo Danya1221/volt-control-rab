@@ -5,7 +5,7 @@ from sqlalchemy import select
 from app.main import Product, Offer
 from app import miniapp
 from app.publisher import _desired
-from app.integrated_collector import persist
+from app.integrated_collector import SupplierSource, persist
 from tests.test_incoming_products import setup, msg
 
 
@@ -55,6 +55,28 @@ def test_ambiguous_bare_family_or_watch_size_is_not_auto_approved(monkeypatch):
     with factory() as db:
         assert not db.scalars(select(Offer)).all()
         assert all(not p.approved for p in db.scalars(select(Product)))
+    engine.dispose()
+
+
+def test_android_allowed_only_from_other_source_with_explicit_sim_and_storage(monkeypatch):
+    engine, factory = setup(monkeypatch)
+    with factory() as db:
+        db.add(SupplierSource(account='miniapp-1234', chat_id=2, is_hi_catalog=False))
+        db.commit()
+    now = datetime(2026, 11, 3, 10, 0, tzinfo=timezone.utc)
+    text = ('Samsung Galaxy S25 256 Black eSIM - 70000\n'
+            'Samsung Galaxy S25 256 Black - 68000\n'
+            'Samsung Galaxy S25 Black eSIM - 69000')
+    for chat in (1, 2):
+        incoming = msg(40, text, now-timedelta(minutes=1))
+        persist(factory, 'miniapp-1234', chat, incoming)
+        miniapp.stage_incoming_product('miniapp-1234', chat, incoming, now)
+    with factory() as db:
+        offers = db.scalars(select(Offer)).all()
+        assert len(offers) == 1
+        source = db.scalar(select(miniapp.IncomingProduct).where(miniapp.IncomingProduct.product_id == offers[0].product_id))
+        assert source.chat_id == 2
+        assert db.get(Product, offers[0].product_id).sim == 'eSIM'
     engine.dispose()
 
 
