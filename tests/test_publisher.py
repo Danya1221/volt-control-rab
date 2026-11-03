@@ -93,7 +93,7 @@ def test_crash_pending_is_never_replayed():
     engine.dispose()
 
 
-def test_rebinding_failure_never_creates_duplicate_and_missing_destination_does_not_delete():
+def test_rebinding_sends_new_post_before_removing_old_and_missing_destination_does_not_delete():
     engine, factory = setup_db(); bot = mock_bot()
     asyncio.run(publisher.reconcile_publication(bot, factory))
     with factory() as db:
@@ -111,7 +111,9 @@ def test_rebinding_failure_never_creates_duplicate_and_missing_destination_does_
         db.commit()
     bot.delete_message.side_effect = OSError()
     assert asyncio.run(publisher.reconcile_publication(bot, factory))['errors'] == 1
-    assert bot.send_message.await_count == 1
+    assert bot.send_message.await_count == 2
+    assert asyncio.run(publisher.reconcile_publication(bot, factory))['errors'] == 1
+    assert bot.send_message.await_count == 2
     engine.dispose()
 
 

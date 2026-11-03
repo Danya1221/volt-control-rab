@@ -91,6 +91,20 @@ def test_import_on_disposable_postgres(monkeypatch):
             assert db.scalar(select(main.Offer).where(main.Offer.product_id == auto.id)).cost == 23500
         sources = miniapp.message_sources(1)['sources']
         assert len(sources) == 1 and sources[0]['count'] == 4
+        from unittest.mock import AsyncMock
+        from app import publisher
+        import asyncio
+        with db_factory() as db:
+            phone = db.scalar(select(main.Product).where(main.Product.model.like('iPhone 17 Pro 256%')))
+            db.add(publisher.PublicationSwitch(id=1, enabled=True))
+            db.add(publisher.Publication(product_id=phone.id, chat_id=-10099, thread_id=17,
+                                         message_id=123, content='old', state='sent', error=''))
+            db.commit()
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=124)),
+                              edit_message_text=AsyncMock(), delete_message=AsyncMock())
+        assert asyncio.run(publisher.reconcile_publication(bot, db_factory))['edited'] == 1
+        assert '<b>iPhone 17 Pro</b>' in bot.edit_message_text.await_args.kwargs['text']
+        bot.send_message.assert_not_awaited()
     finally:
         CollectorBase.metadata.drop_all(engine)
         main.Base.metadata.drop_all(engine)

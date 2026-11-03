@@ -144,6 +144,11 @@ const firstTest=(async()=>{await new Promise(r=>setImmediate(r));assert.equal(el
   await elements.publication.children.find(x=>x.textContent==='Приостановить').onclick();
   assert.match(all(elements.publication),/Публикация приостановлена/);
   assert.equal(publicationCalls.filter(x=>x.key==='/publication/sync'&&x.method==='POST').length,1);
+  data['/publication'].groups=[{thread_id:41,text:'iPhone 17 Pro\n\nBlue — 90 000 ₽\n\nSilver — 91 000 ₽'}];
+  await vm.runInContext('loadPublication(true)',context);
+  assert.match(all(elements.publication),/Предпросмотр общих сообщений/);
+  const groupedPreview=elements.publication.children.find(x=>x.tag==='details');
+  assert.match(all(groupedPreview),/Blue/);assert.match(all(groupedPreview),/Silver/);
   console.log('Publication preview and explicit sync passed');
 
 
