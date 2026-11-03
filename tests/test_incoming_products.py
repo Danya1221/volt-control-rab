@@ -33,7 +33,7 @@ def msg(mid,text,date,out=False,edit_date=None):
     return SimpleNamespace(id=mid,raw_text=text,date=date,out=out,edit_date=edit_date)
 
 
-def test_automatic_staging_is_idempotent_and_never_confirms_prices(monkeypatch):
+def test_automatic_staging_is_idempotent_and_filters_hi_android(monkeypatch):
     engine, db = setup(monkeypatch)
     now = datetime.now(timezone.utc)
     source='miniapp-1234'
@@ -44,10 +44,13 @@ def test_automatic_staging_is_idempotent_and_never_confirms_prices(monkeypatch):
     miniapp.stage_incoming_product(source,1,m,now)
     with db() as session:
         products=session.scalars(select(Product)).all()
-        assert len(products)==1 and products[0].category=='Наушники' and not products[0].approved
-        assert len(session.scalars(select(miniapp.IncomingProduct)).all())==1
-        assert session.scalars(select(Supplier)).all()==[]
-        assert session.scalars(select(Offer)).all()==[]
+        assert len(products)==2
+        phone = next(p for p in products if p.category == 'Смартфоны')
+        headphones = next(p for p in products if p.category == 'Наушники')
+        assert phone.approved and not headphones.approved
+        assert len(session.scalars(select(miniapp.IncomingProduct)).all())==2
+        assert len(session.scalars(select(Supplier)).all())==1
+        assert session.scalar(select(Offer)).product_id == phone.id
     other=msg(2,'🎧AirPods 5 - 10600',now-timedelta(days=1))
     outgoing=msg(3,'🎧AirPods 5 - 10600',now,out=True)
     unknown=msg(4,'🎧AirPods 5 - 10600',now)
@@ -55,7 +58,7 @@ def test_automatic_staging_is_idempotent_and_never_confirms_prices(monkeypatch):
         persist(db,source,chat,item)
         miniapp.stage_incoming_product(source,chat,item,now)
     with db() as session:
-        assert len(session.scalars(select(Product)).all())==1
+        assert len(session.scalars(select(Product)).all())==2
     engine.dispose()
 
 
