@@ -4,6 +4,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -69,6 +70,109 @@ def test_failed_group_edit_never_deletes_originals_and_retries(monkeypatch):
     assert asyncio.run(publisher.reconcile_publication(bot, factory))['deleted'] == 2
     assert bot.send_message.await_count == 0
     engine.dispose()
+
+
+def _bad_request(message):
+    return TelegramBadRequest(method=SimpleNamespace(), message=message)
+
+
+def test_deleted_group_anchor_is_recreated_and_old_posts_are_cleaned_up():
+    engine, factory, bot = fixture()
+    bot.edit_message_text.side_effect = _bad_request('Bad Request: message to edit not found')
+    bot.delete_message.side_effect = _bad_request('Bad Request: message to delete not found')
+    result = asyncio.run(publisher.reconcile_publication(bot, factory))
+    assert result['sent'] == 1 and result['deleted'] == 2 and result['errors'] == 0
+    assert bot.send_message.await_count == 1
+    with factory() as db:
+        row = db.scalar(select(publisher.Publication))
+        assert row.message_id == 500 and row.state == 'sent'
+    bot.edit_message_text.reset_mock()
+    assert asyncio.run(publisher.reconcile_publication(bot, factory))['sent'] == 0
+    bot.edit_message_text.assert_not_awaited()
+    assert bot.send_message.await_count == 1
+    engine.dispose()
+
+
+def test_manual_verify_recovers_deleted_unchanged_group():
+    engine, factory, bot = fixture()
+    asyncio.run(publisher.reconcile_publication(bot, factory))
+    bot.edit_message_text.side_effect = _bad_request('Bad Request: message to edit not found')
+    result = asyncio.run(publisher.reconcile_publication(bot, factory, verify_existing=True))
+    assert result['sent'] == 1 and result['errors'] == 0
+    assert bot.send_message.await_count == 1
+    with factory() as db:
+        row = db.scalar(select(publisher.Publication))
+        assert row.message_id == 500 and row.state == 'sent'
+    assert asyncio.run(publisher.reconcile_publication(bot, factory))['sent'] == 0
+    assert bot.send_message.await_count == 1
+    engine.dispose()
+
+
+def test_manual_verify_keeps_existing_unchanged_post():
+    engine, factory, bot = fixture()
+    asyncio.run(publisher.reconcile_publication(bot, factory))
+    bot.edit_message_text.side_effect = _bad_request('Bad Request: message is not modified')
+    result = asyncio.run(publisher.reconcile_publication(bot, factory, verify_existing=True))
+    assert result['sent'] == 0 and result['errors'] == 0
+    bot.send_message.assert_not_awaited()
+    with factory() as db:
+        row = db.scalar(select(publisher.Publication))
+        assert row.message_id == 101 and row.state == 'sent'
+    engine.dispose()
+
+
+def test_other_bad_request_never_reposts_or_deletes_originals():
+    engine, factory, bot = fixture()
+    bot.edit_message_text.side_effect = _bad_request("Bad Request: message can't be edited")
+    result = asyncio.run(publisher.reconcile_publication(bot, factory))
+    assert result['errors'] == 1
+    bot.send_message.assert_not_awaited()
+    bot.delete_message.assert_not_awaited()
+    with factory() as db:
+        row = db.get(publisher.Publication, 1)
+        assert row.message_id == 101 and row.state == 'edit_failed'
+    engine.dispose()
+
+
+def test_unconfirmed_replacement_is_never_automatically_repeated():
+    engine, factory, bot = fixture()
+    bot.edit_message_text.side_effect = _bad_request('Bad Request: message to edit not found')
+    bot.send_message.side_effect = TimeoutError()
+    result = asyncio.run(publisher.reconcile_publication(bot, factory))
+    assert result['uncertain'] == 1
+    assert bot.send_message.await_count == 1
+    asyncio.run(publisher.reconcile_publication(bot, factory, verify_existing=True))
+    assert bot.send_message.await_count == 1
+    bot.delete_message.assert_not_awaited()
+    engine.dispose()
+
+
+def test_failed_edit_with_unchanged_content_is_actually_checked_again():
+    engine, factory, bot = fixture()
+    asyncio.run(publisher.reconcile_publication(bot, factory))
+    with factory() as db:
+        row = db.scalar(select(publisher.Publication))
+        row.state, row.error = 'edit_failed', 'TelegramBadRequest'
+        db.commit()
+    bot.edit_message_text.side_effect = _bad_request('Bad Request: message to edit not found')
+    result = asyncio.run(publisher.reconcile_publication(bot, factory))
+    assert result['sent'] == 1
+    with factory() as db:
+        row = db.scalar(select(publisher.Publication))
+        assert row.message_id == 500 and row.state == 'sent'
+    engine.dispose()
+
+
+def test_manual_sync_requests_verification(monkeypatch):
+    bot = SimpleNamespace(session=SimpleNamespace(close=AsyncMock()))
+    reconcile = AsyncMock(return_value={'sent': 0})
+    monkeypatch.setenv('TG_BOT_TOKEN', 'test-token')
+    monkeypatch.setattr(publisher, 'publication_enabled', lambda: True)
+    monkeypatch.setattr(publisher, 'Bot', lambda token: bot)
+    monkeypatch.setattr(publisher, 'reconcile_publication', reconcile)
+    assert asyncio.run(publisher.sync_publication()) == {'sent': 0}
+    reconcile.assert_awaited_once_with(bot, verify_existing=True)
+    bot.session.close.assert_awaited_once()
 
 
 def test_uncertain_old_send_blocks_group_and_does_not_delete(monkeypatch):

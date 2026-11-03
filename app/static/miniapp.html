@@ -266,8 +266,9 @@ async function loadPublication(showItems=false){
    try{await api('/publication/enable',{method:'POST'});await loadPublication(showItems)}catch(e){status.className='error';status.textContent='Не удалось включить публикацию: '+e.message}
   }));
   else{
+   box.append(el('p','При обновлении проверим сообщения и восстановим те, которые удалены.','muted'));
    box.append(btn('Обновить публикацию',async()=>{
-    status.className='muted';status.textContent='Обновляем публикацию…';
+    status.className='muted';status.textContent='Проверяем сообщения и обновляем публикацию…';
     try{await api('/publication/sync',{method:'POST'});await loadPublication(showItems)}catch(e){status.className='error';status.textContent='Не удалось обновить публикацию: '+e.message}
    }));
    box.append(btn('Приостановить',async()=>{

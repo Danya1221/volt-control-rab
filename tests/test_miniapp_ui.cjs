@@ -137,6 +137,7 @@ const firstTest=(async()=>{await new Promise(r=>setImmediate(r));assert.equal(el
   assert.match(all(elements.publication),/Не удалось включить публикацию: Бот не имеет доступа/);
   failPublish=false;await elements.publication.children.find(x=>x.textContent==='Включить публикацию').onclick();
   assert.match(all(elements.publication),/Публикация включена/);
+  assert.match(all(elements.publication),/восстановим те, которые удалены/);
   assert(!publicationCalls.some(x=>x.key==='/publication/sync'));
   data['/publication'].errors=1;data['/publication'].uncertain=2;data['/publication'].retry_after=30;data['/publication'].problem_products=[{state:'send_failed',error:'TelegramForbiddenError'}];
   await elements.publication.children.find(x=>x.textContent==='Обновить публикацию').onclick();

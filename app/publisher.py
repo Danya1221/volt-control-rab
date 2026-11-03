@@ -286,7 +286,7 @@ def _retry_seconds(switch):
     return max(0, int((due - datetime.now(timezone.utc)).total_seconds() + 0.999))
 
 
-async def reconcile_publication(bot, factory=None):
+async def reconcile_publication(bot, factory=None, *, verify_existing=False):
     """Update shared model posts, then remove superseded individual posts.
 
     Existing individual messages are reused as anchors when possible. Intent
@@ -336,9 +336,8 @@ async def reconcile_publication(bot, factory=None):
                 if row and row.message_id:
                     if (row.chat_id, row.thread_id) != (chat_id, thread_id):
                         stats['stopped'] = 'data_changed'; break
-                    if row.content == content:
-                        if row.state != 'sent':
-                            _stamp(row, 'sent'); db.commit()
+                    unchanged = row.content == content
+                    if unchanged and row.state == 'sent' and not verify_existing:
                         continue
                     try:
                         await bot.edit_message_text(chat_id=chat_id, message_id=row.message_id,
@@ -350,12 +349,24 @@ async def reconcile_publication(bot, factory=None):
                         db.commit(); stats['errors'] += 1
                         stats['retry_after'] = _retry_seconds(db.get(PublicationSwitch, 1)); break
                     except TelegramBadRequest as exc:
-                        if 'message is not modified' not in str(exc).casefold():
+                        error = str(exc).casefold()
+                        if 'message to edit not found' in error:
+                            # Telegram confirmed the old post does not exist.
+                            # Record that fact before sending its replacement.
+                            row.message_id, row.content = None, ''
+                            _stamp(row, 'send_failed', 'message_deleted'); db.commit()
+                        elif 'message is not modified' in error:
+                            row.content = content; _stamp(row, 'sent'); db.commit()
+                            continue
+                        else:
                             _stamp(row, 'edit_failed', type(exc).__name__); db.commit(); stats['errors'] += 1; continue
                     except Exception as exc:
                         _stamp(row, 'edit_failed', type(exc).__name__); db.commit(); stats['errors'] += 1; continue
-                    row.content = content; _stamp(row, 'sent'); db.commit(); stats['edited'] += 1
-                    continue
+                    if row.message_id:
+                        row.content = content; _stamp(row, 'sent'); db.commit()
+                        if not unchanged:
+                            stats['edited'] += 1
+                        continue
                 if row and row.state != 'send_failed':
                     stats['uncertain'] += 1
                     continue
@@ -504,7 +515,9 @@ async def sync_publication():
         raise HTTPException(503, 'Токен бота не настроен')
     bot = Bot(token=token)
     try:
-        return await reconcile_publication(bot)
+        # A user-requested sync also verifies unchanged posts: Telegram's Bot
+        # API otherwise has no way to tell that a saved message was deleted.
+        return await reconcile_publication(bot, verify_existing=True)
     finally:
         await bot.session.close()
 
