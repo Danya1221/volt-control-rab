@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import hashlib
 import os
 import re
 from contextlib import asynccontextmanager
@@ -22,6 +23,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.main import Base, Offer, Product, Sessions
 from app.miniapp import CatalogDestination, owner, topic_for_product
 from app.publication_pricing import publication_price
+from app.price_parser import sim_configuration
+from app.product_lexicon import normalize_product_name
 
 router = APIRouter(prefix='/miniapp/api/publication', dependencies=[Depends(owner)])
 _lock = asyncio.Lock()
@@ -48,6 +51,18 @@ class PublicationSwitch(Base):
     retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class PublicationGroup(Base):
+    """Stable identity for a model/topic/page, independent of its products."""
+    __tablename__ = 'catalog_publication_groups'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    group_key: Mapped[str] = mapped_column(String(64), unique=True)
+    publication_key: Mapped[int | None] = mapped_column(Integer, unique=True, nullable=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    thread_id: Mapped[int] = mapped_column(BigInteger)
+    title_key: Mapped[str] = mapped_column(String(300))
+    page: Mapped[int] = mapped_column(Integer)
+
+
 def publication_enabled(factory=None):
     with (factory or Sessions)() as db:
         row = db.get(PublicationSwitch, 1)
@@ -58,6 +73,8 @@ def _display_name(p: Product) -> str:
     parts = []
     for item in (p.brand, p.model, p.memory, p.color, p.sim):
         item = re.sub(r'[\U0001F1E6-\U0001F1FF]{2}', '', item or '').strip()
+        if item and item == (p.sim or '').strip() and item in sim_configuration(p.model or ''):
+            continue
         if item and not re.search(r'(?<!\w)' + re.escape(item) + r'(?!\w)', ' '.join(parts), re.I):
             parts.append(item)
     return ' '.join(parts)
@@ -96,6 +113,106 @@ def _desired(db):
         if topic is not None:
             result[p.id] = (destination.chat_id, topic.thread_id, _display(p, publication_price(db, p)))
     return result
+
+
+def _group_title(product):
+    name = normalize_product_name(product.model or '')
+    if product.brand.casefold() == 'samsung' and product.category.casefold() == 'смартфоны':
+        match = re.search(r'\b(?:samsung\s+)?(?:galaxy\s+)?(?:[as]\d{2}[a-z]?|z\s+(?:flip|fold)\s*\d+)(?:\s+(?:ultra|plus|pro))?\b', name, re.I)
+        if match:
+            return re.sub(r'\s+', ' ', match.group(0)).strip()
+    for pattern in (
+        r'\biphone\s+(?:\d{1,2}[a-zе]?|se\s*\d*)(?:\s+(?:pro\s+max|pro|plus|air))?',
+        r'\bapple\s+watch\s+(?:se\s*\d+|s\s*\d+|ul(?:tra)?\s*\d+)',
+        r'\bairpods\s+(?:max\s*\d*|pro\s*\d*|\d+(?:\s+anc)?)',
+        r'\bmacbook\s+(?:air|pro|neo)\s*\d*',
+        r'\bipad\s+(?:air|pro|mini|\d+)\s*\d*',
+    ):
+        match = re.search(pattern, name, re.I)
+        if match:
+            return re.sub(r'\s+', ' ', match.group(0)).strip()
+    # Keep unrelated categories separate even if they share a Telegram topic.
+    return (product.brand + ' · ' + product.category).strip(' ·')
+
+
+def _units(value):
+    return len(value.encode('utf-16-le')) // 2
+
+
+def _pages(title, entries):
+    header = '<b>' + html.escape(title) + '</b>'
+    pages, chunk = [], []
+    for item in entries:
+        candidate = header + '\n\n' + '\n\n'.join(row[1] for row in [*chunk, item])
+        if chunk and _units(candidate) > 3500:
+            pages.append(chunk)
+            chunk = []
+        chunk.append(item)
+    if chunk:
+        pages.append(chunk)
+    return [(header + (f' · {number + 1}' if len(pages) > 1 else '') + '\n\n' +
+             '\n\n'.join(row[1] for row in rows), rows) for number, rows in enumerate(pages)]
+
+
+def _group_targets(db, create=False):
+    """Build stable model/topic pages from individually eligible products."""
+    individual = _desired(db)
+    products = {p.id: p for p in db.scalars(select(Product)).all()}
+    grouped = {}
+    for pid, (chat, thread, content) in individual.items():
+        product = products[pid]
+        title = _group_title(product)
+        grouped.setdefault((chat, thread, title.casefold()), (title, []))[1].append((pid, content))
+    indexes = {x.group_key: x for x in db.scalars(select(PublicationGroup)).all()}
+    reserved = {x.publication_key for x in indexes.values() if x.publication_key is not None}
+    old = {x.product_id: x for x in db.scalars(select(Publication)).all()}
+    targets, members = {}, {}
+    for (chat, thread, title_key), (title, entries) in sorted(grouped.items()):
+        for page, (content, rows) in enumerate(_pages(title, entries)):
+            key = hashlib.sha256(f'{chat}:{thread}:{title_key}:{page}'.encode()).hexdigest()
+            index = indexes.get(key)
+            if index is None and create:
+                index = PublicationGroup(group_key=key, publication_key=None, chat_id=chat,
+                                         thread_id=thread, title_key=title_key, page=page)
+                db.add(index); db.flush()
+                anchor = next((pid for pid, _ in rows if pid not in reserved and pid in old
+                               and old[pid].message_id and old[pid].chat_id == chat
+                               and old[pid].thread_id == thread and old[pid].state != 'uncertain'), None)
+                index.publication_key = anchor if anchor is not None else -index.id
+                reserved.add(index.publication_key); indexes[key] = index
+                db.flush()
+            publication_key = index.publication_key if index else 'preview:' + key
+            if publication_key is None:
+                continue
+            targets[publication_key] = (chat, thread, content)
+            for pid, _ in rows:
+                members[pid] = publication_key
+    return targets, members, individual
+
+
+def _current_group_target(factory, group_id, expected_chat):
+    with factory() as fresh:
+        destination = fresh.get(CatalogDestination, 1)
+        if not destination or not destination.is_forum or destination.chat_id != expected_chat:
+            raise HTTPException(409, 'Привязка чата изменена')
+        group = fresh.scalar(select(PublicationGroup).where(PublicationGroup.publication_key == group_id))
+        if not group or group.chat_id != destination.chat_id:
+            return None
+        entries, title = [], None
+        query = select(Product).order_by(Product.brand, Product.model, Product.memory, Product.color, Product.id)
+        for product in fresh.scalars(query):
+            current_title = _group_title(product)
+            if current_title.casefold() != group.title_key or not _eligible(fresh, product):
+                continue
+            topic = topic_for_product(fresh, destination.chat_id, product.brand, product.category, product.id)
+            if topic is None or topic.thread_id != group.thread_id:
+                continue
+            title = title or current_title
+            entries.append((product.id, _display(product, publication_price(fresh, product))))
+        pages = _pages(title, entries) if title else []
+        if group.page >= len(pages):
+            return None
+        return (group.chat_id, group.thread_id, pages[group.page][0])
 
 
 def _current_target(factory, product_id, expected_chat):
@@ -170,6 +287,11 @@ def _retry_seconds(switch):
 
 
 async def reconcile_publication(bot, factory=None):
+    """Update shared model posts, then remove superseded individual posts.
+
+    Existing individual messages are reused as anchors when possible. Intent
+    is persisted before a new send; uncertain sends are never retried.
+    """
     factory = factory or Sessions
     stats = {'sent': 0, 'edited': 0, 'deleted': 0, 'uncertain': 0, 'errors': 0}
     async with _exclusive(factory) as lock_connection:
@@ -180,69 +302,43 @@ async def reconcile_publication(bot, factory=None):
             if wait:
                 stats['retry_after'] = wait
                 return stats
-            # A pending send may have reached Telegram before a restart. Never
-            # send again when its outcome cannot be established.
             for row in db.scalars(select(Publication).where(Publication.state == 'pending')).all():
                 _stamp(row, 'uncertain', 'interrupted_send')
             db.commit()
-            desired = _desired(db)
+            desired, members, individual = _group_targets(db, create=True)
+            db.commit()
             expected_chat = db.get(CatalogDestination, 1).chat_id
             existing = {row.product_id: row for row in db.scalars(select(Publication)).all()}
+            group_keys = {g.publication_key for g in db.scalars(select(PublicationGroup)).all()}
             last_send = None
-            for product_id in [*sorted(set(existing) - set(desired)), *desired]:
+            for group_id, target in desired.items():
                 if not publication_enabled(factory):
                     stats['paused'] = True
                     break
-                row = existing.get(product_id)
-                target = desired.get(product_id)
-                try:
-                    _check_lock(lock_connection)
-                    if _current_target(factory, product_id, expected_chat) != target:
-                        stats['stopped'] = 'data_changed'
-                        break
-                except HTTPException:
-                    stats['stopped'] = 'data_changed'
-                    break
-                except Exception:
-                    stats['stopped'] = 'database_connection_lost'
-                    break
-                if row and row.state == 'uncertain':
+                row = existing.get(group_id)
+                # An old per-product send may have succeeded without a stored ID.
+                # Do not produce another post for that page until it is resolved.
+                uncertain_legacy = any(pid != group_id and group == group_id and
+                    (legacy := existing.get(pid)) is not None and legacy.state == 'uncertain' and not legacy.message_id
+                    for pid, group in members.items())
+                if uncertain_legacy or (row and row.state == 'uncertain'):
                     stats['uncertain'] += 1
                     continue
-                # A route change requires deleting the old post before posting
-                # in the new thread. Telegram cannot move messages between topics.
-                if row and row.message_id and (target is None or (row.chat_id, row.thread_id) != target[:2]):
-                    try:
-                        await bot.delete_message(chat_id=row.chat_id, message_id=row.message_id)
-                    except asyncio.CancelledError:
-                        raise
-                    except TelegramRetryAfter as exc:
-                        _stamp(row, 'delete_failed', type(exc).__name__)
-                        _defer(db, exc)
-                        db.commit(); stats['errors'] += 1
-                        stats['retry_after'] = _retry_seconds(db.get(PublicationSwitch, 1))
-                        break
-                    except Exception as exc:
-                        _stamp(row, 'delete_failed', type(exc).__name__)
-                        db.commit()
-                        stats['errors'] += 1
-                        continue
-                    db.delete(row)
-                    db.commit()
-                    row = None
-                    stats['deleted'] += 1
-                if target is None:
-                    # A confirmed failed send has no Telegram message.
-                    if row and not row.message_id and row.state == 'send_failed':
-                        db.delete(row)
-                        db.commit()
-                    continue
+                try:
+                    _check_lock(lock_connection)
+                    if _current_group_target(factory, group_id, expected_chat) != target:
+                        stats['stopped'] = 'data_changed'; break
+                except HTTPException:
+                    stats['stopped'] = 'data_changed'; break
+                except Exception:
+                    stats['stopped'] = 'database_connection_lost'; break
                 chat_id, thread_id, content = target
                 if row and row.message_id:
+                    if (row.chat_id, row.thread_id) != (chat_id, thread_id):
+                        stats['stopped'] = 'data_changed'; break
                     if row.content == content:
                         if row.state != 'sent':
-                            _stamp(row, 'sent')
-                            db.commit()
+                            _stamp(row, 'sent'); db.commit()
                         continue
                     try:
                         await bot.edit_message_text(chat_id=chat_id, message_id=row.message_id,
@@ -250,51 +346,39 @@ async def reconcile_publication(bot, factory=None):
                     except asyncio.CancelledError:
                         raise
                     except TelegramRetryAfter as exc:
-                        _stamp(row, 'edit_failed', type(exc).__name__)
-                        _defer(db, exc)
+                        _stamp(row, 'edit_failed', type(exc).__name__); _defer(db, exc)
                         db.commit(); stats['errors'] += 1
-                        stats['retry_after'] = _retry_seconds(db.get(PublicationSwitch, 1))
-                        break
+                        stats['retry_after'] = _retry_seconds(db.get(PublicationSwitch, 1)); break
                     except TelegramBadRequest as exc:
                         if 'message is not modified' not in str(exc).casefold():
-                            _stamp(row, 'edit_failed', type(exc).__name__)
-                            db.commit(); stats['errors'] += 1
-                            continue
+                            _stamp(row, 'edit_failed', type(exc).__name__); db.commit(); stats['errors'] += 1; continue
                     except Exception as exc:
-                        _stamp(row, 'edit_failed', type(exc).__name__)
-                        db.commit(); stats['errors'] += 1
-                        continue
-                    row.content = content
-                    _stamp(row, 'sent')
-                    db.commit(); stats['edited'] += 1
+                        _stamp(row, 'edit_failed', type(exc).__name__); db.commit(); stats['errors'] += 1; continue
+                    row.content = content; _stamp(row, 'sent'); db.commit(); stats['edited'] += 1
                     continue
-                if row and row.state == 'send_failed':
-                    # Explicitly rejected requests are retried on a later sync.
-                    row.chat_id, row.thread_id = chat_id, thread_id
-                elif not row:
-                    row = Publication(product_id=product_id, chat_id=chat_id, thread_id=thread_id,
+                if row and row.state != 'send_failed':
+                    stats['uncertain'] += 1
+                    continue
+                if not row:
+                    row = Publication(product_id=group_id, chat_id=chat_id, thread_id=thread_id,
                                       state='pending', content='', error='')
-                    db.add(row)
+                    db.add(row); existing[group_id] = row
                 if last_send is not None:
                     remaining = 3.1 - (asyncio.get_running_loop().time() - last_send)
                     if remaining > 0:
                         await asyncio.sleep(remaining)
                 if not publication_enabled(factory):
-                    stats['paused'] = True
-                    break
+                    stats['paused'] = True; break
                 try:
                     _check_lock(lock_connection)
-                    if _current_target(factory, product_id, expected_chat) != target:
-                        stats['stopped'] = 'data_changed'
-                        break
+                    if _current_group_target(factory, group_id, expected_chat) != target:
+                        stats['stopped'] = 'data_changed'; break
                 except HTTPException:
-                    stats['stopped'] = 'data_changed'
-                    break
+                    stats['stopped'] = 'data_changed'; break
                 except Exception:
-                    stats['stopped'] = 'database_connection_lost'
-                    break
-                _stamp(row, 'pending')
-                db.commit()
+                    stats['stopped'] = 'database_connection_lost'; break
+                row.chat_id, row.thread_id = chat_id, thread_id
+                _stamp(row, 'pending'); db.commit()
                 try:
                     sent = await bot.send_message(chat_id=chat_id, message_thread_id=thread_id,
                                                   text=content, parse_mode='HTML')
@@ -303,25 +387,65 @@ async def reconcile_publication(bot, factory=None):
                     if type(message_id) is not int or message_id <= 0:
                         raise ValueError('Missing Telegram message ID')
                 except asyncio.CancelledError:
-                    _stamp(row, 'uncertain', 'cancelled_during_send'); db.commit()
-                    raise
+                    _stamp(row, 'uncertain', 'cancelled_during_send'); db.commit(); raise
                 except TelegramRetryAfter as exc:
-                    _stamp(row, 'send_failed', type(exc).__name__)
-                    _defer(db, exc)
+                    _stamp(row, 'send_failed', type(exc).__name__); _defer(db, exc)
                     db.commit(); stats['errors'] += 1
-                    stats['retry_after'] = _retry_seconds(db.get(PublicationSwitch, 1))
-                    break
+                    stats['retry_after'] = _retry_seconds(db.get(PublicationSwitch, 1)); break
                 except (TelegramBadRequest, TelegramForbiddenError, TelegramUnauthorizedError) as exc:
-                    _stamp(row, 'send_failed', type(exc).__name__)
-                    db.commit(); stats['errors'] += 1
-                    continue
+                    _stamp(row, 'send_failed', type(exc).__name__); db.commit(); stats['errors'] += 1; continue
                 except Exception as exc:
-                    _stamp(row, 'uncertain', type(exc).__name__)
-                    db.commit(); stats['uncertain'] += 1
-                    continue
+                    _stamp(row, 'uncertain', type(exc).__name__); db.commit(); stats['uncertain'] += 1; continue
                 row.message_id, row.content = message_id, content
-                _stamp(row, 'sent')
-                db.commit(); stats['sent'] += 1
+                _stamp(row, 'sent'); db.commit(); stats['sent'] += 1
+
+            # Remove old single-item posts only after their shared replacement
+            # has definitely been sent/edited and still contains this product.
+            all_ready = not (stats['errors'] or stats['uncertain'] or stats.get('stopped') or stats.get('paused'))
+            all_ready &= all((r := existing.get(k)) is not None and r.state == 'sent' and
+                             r.message_id and r.content == v[2] for k, v in desired.items())
+            if not all_ready:
+                return stats
+            for old_id, row in list(existing.items()):
+                if old_id in desired or row.state == 'uncertain':
+                    continue
+                if old_id in group_keys:
+                    # An old page may be removed only after all new pages exist.
+                    try:
+                        if _current_group_target(factory, old_id, expected_chat) is not None:
+                            stats['stopped'] = 'data_changed'; break
+                    except Exception:
+                        stats['stopped'] = 'data_changed'; break
+                else:
+                    group_id = members.get(old_id)
+                    if group_id is None:
+                        continue
+                    target_row = existing.get(group_id)
+                    try:
+                        _check_lock(lock_connection)
+                        if (_current_target(factory, old_id, expected_chat) != individual[old_id] or
+                                not target_row or target_row.state != 'sent' or target_row.content != desired[group_id][2]):
+                            stats['stopped'] = 'data_changed'; break
+                    except Exception:
+                        stats['stopped'] = 'data_changed'; break
+                if not publication_enabled(factory):
+                    stats['paused'] = True; break
+                if row.message_id:
+                    try:
+                        _check_lock(lock_connection)
+                        await bot.delete_message(chat_id=row.chat_id, message_id=row.message_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except TelegramRetryAfter as exc:
+                        _stamp(row, 'delete_failed', type(exc).__name__); _defer(db, exc)
+                        db.commit(); stats['errors'] += 1
+                        stats['retry_after'] = _retry_seconds(db.get(PublicationSwitch, 1)); break
+                    except TelegramBadRequest as exc:
+                        if 'message to delete not found' not in str(exc).casefold():
+                            _stamp(row, 'delete_failed', type(exc).__name__); db.commit(); stats['errors'] += 1; continue
+                    except Exception as exc:
+                        _stamp(row, 'delete_failed', type(exc).__name__); db.commit(); stats['errors'] += 1; continue
+                db.delete(row); db.commit(); stats['deleted'] += 1
     return stats
 
 
@@ -332,6 +456,9 @@ def publication_status():
         by_product = {row.product_id: row for row in rows}
         items = []
         destination = db.get(CatalogDestination, 1)
+        group_members, grouped_targets = {}, {}
+        if destination and destination.is_forum:
+            grouped_targets, group_members, _ = _group_targets(db)
         products = db.scalars(select(Product).order_by(Product.brand, Product.model, Product.memory, Product.color, Product.id)).all()
         blockers = {'total': len(products), 'needs_approval': 0, 'hidden': 0,
                     'missing_sim': 0, 'no_offer': 0, 'no_topic': 0, 'no_forum': 0}
@@ -351,7 +478,7 @@ def publication_status():
                 if topic is None:
                     blockers['no_topic'] += 1
                     continue
-                row = by_product.get(product.id)
+                row = by_product.get(group_members.get(product.id, product.id))
                 price = publication_price(db, product)
                 items.append({'name': _display_name(product), 'topic': topic.title,
                               'price': price['price'], 'status': row.state if row else 'new'})
@@ -362,6 +489,8 @@ def publication_status():
                 'errors': sum(row.state in ('send_failed', 'edit_failed', 'delete_failed') for row in rows),
                 'price_mode': 'verified_only', 'blockers': blockers,
                 'items': items,
+                'groups': [{'thread_id': target[1], 'text': html.unescape(re.sub(r'<[^>]+>', '', target[2]))}
+                           for target in grouped_targets.values()],
                 'problem_products': [{'product_id': row.product_id, 'state': row.state, 'error': row.error}
                                      for row in rows if row.state != 'sent']}
 
