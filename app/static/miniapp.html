@@ -276,7 +276,8 @@ async function loadPublication(showItems=false){
    },'secondary'));
   }
   if(showItems){
-   const items=data.items||[];
+   const groups=data.groups||[];const items=data.items||[];
+   if(groups.length){box.append(el('p','Предпросмотр общих сообщений:','label'));for(const group of groups){const d=el('details');d.append(el('summary',group.text.split('\n')[0]),el('pre',group.text));box.append(d)}return}
    box.append(el('p',items.length?'Предпросмотр товаров:':'Нет товаров для публикации.','label'));
    const labels={new:'готов к публикации',sent:'опубликован',pending:'отправляется',uncertain:'результат не подтверждён',send_failed:'ошибка отправки',edit_failed:'ошибка обновления',delete_failed:'ошибка удаления'};
    for(const item of items){const price=String(item.price??'По запросу');const displayPrice=/^\d+(?:[.,]\d+)?$/.test(price)?price+' ₽':price;const row=el('p',(item.name||'Товар')+' · '+(item.topic||'Тема не выбрана')+' · '+displayPrice+(item.status?' · '+(labels[item.status]||item.status):''),'muted');box.append(row)}
