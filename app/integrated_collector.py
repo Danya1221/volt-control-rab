@@ -53,6 +53,17 @@ class SupplierSource(Base):
     is_hi_catalog: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class SupplierSourceInfo(Base):
+    """Display names observed when resolving a real Telegram peer."""
+    __tablename__ = 'supplier_telegram_source_info'
+    __table_args__ = (UniqueConstraint('account', 'chat_id'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account: Mapped[str] = mapped_column(String(100))
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    username: Mapped[str] = mapped_column(String(255), default='')
+    title: Mapped[str] = mapped_column(String(255), default='')
+
+
 def record_source(db, account, chat_id, configured, entity):
     # Identity comes from resolving the Telegram peer, never the supplier name typed at import.
     names = [str(configured) if isinstance(configured, str) else '', getattr(entity, 'username', '') or '']
@@ -64,6 +75,16 @@ def record_source(db, account, chat_id, configured, entity):
             session.add(SupplierSource(account=account, chat_id=chat_id, is_hi_catalog=is_hi))
         elif is_hi:
             row.is_hi_catalog = True
+        info = session.scalar(select(SupplierSourceInfo).where(SupplierSourceInfo.account == account,
+                              SupplierSourceInfo.chat_id == chat_id))
+        if info is None:
+            info = SupplierSourceInfo(account=account, chat_id=chat_id)
+            session.add(info)
+        username = getattr(entity, 'username', None) or ''
+        title = getattr(entity, 'title', None) or ' '.join(filter(None, (getattr(entity, 'first_name', None),
+                                                                       getattr(entity, 'last_name', None))))
+        info.username = str(username).lstrip('@')[:255]
+        info.title = str(title or '')[:255]
         session.commit()
 
 class ChatCursor(Base):
