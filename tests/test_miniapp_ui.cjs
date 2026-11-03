@@ -71,6 +71,18 @@ const firstTest=(async()=>{await new Promise(r=>setImmediate(r));assert.equal(el
   const confirmSave=entry.children[2].children.find(x=>x.tag==='button');await confirmSave.onclick();
   const req=requests[requests.length-1];assert.equal(req.key,'/accounts/1/messages/10/import-line');assert.equal(req.body.confirmed_iphone,true);assert.equal(req.body.line,52);
   console.log('Price preview pagination and iPhone confirmation passed');
+  data['/accounts/1/message-sources']={sources:[{chat_id:'1',label:'HI · @hi_catalog_bot',count:2},{chat_id:'2',label:'Tech · @tech_online_seller_bot',count:1}]};
+  data['/accounts/1/messages?chat_id=1']={messages:[{id:11,chat_id:'1',seen_at:'2026-10-29T12:00:00Z',text:'HI price'}],next_before:11};
+  data['/accounts/1/messages?before=11&chat_id=1']={messages:[{id:9,chat_id:'1',seen_at:'2026-10-29T12:00:00Z',text:'HI older'}]};
+  data['/accounts/1/messages?chat_id=2']={messages:[{id:12,chat_id:'2',seen_at:'2026-10-29T12:00:00Z',text:'Tech price'}]};
+  const sourcesHolder=new Element('div');context.sourcesHolder=sourcesHolder;
+  await vm.runInContext('loadMessageSources(1,sourcesHolder)',context);
+  const groups=sourcesHolder.children.filter(x=>x.className==='source-group');assert.equal(groups.length,2);
+  groups[0].open=true;await groups[0].ontoggle();groups[1].open=true;await groups[1].ontoggle();
+  assert.match(all(groups[0]),/HI price/);assert.doesNotMatch(all(groups[0]),/Tech price/);assert.match(all(groups[1]),/Tech price/);
+  await groups[0].children[1].children.find(x=>x.textContent==='Ещё сообщения').onclick();
+  assert.match(all(groups[0]),/HI older/);assert.doesNotMatch(all(groups[1]),/HI older/);
+  console.log('Messages separated and paginated by actual source passed');
   data['/destination/topics']={topics:[{thread_id:41,title:'Техника',closed:false}],rules:[],publication_enabled:false};
   data['/products']=[{id:1,brand:'Apple',category:'Смартфоны'}];
   context.destinationForTest={connected:true,is_forum:true};await vm.runInContext('loadTopics(destinationForTest)',context);
