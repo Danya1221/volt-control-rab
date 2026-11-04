@@ -58,6 +58,34 @@ def test_existing_single_posts_are_safely_consolidated_and_reused(monkeypatch):
     engine.dispose()
 
 
+def test_display_does_not_repeat_brand_or_explicit_sim():
+    watch = Product(brand='Apple', model='Apple Watch S11 46 Rose Gold(S/M) 🇺🇸',
+                    category='Умные часы', memory='', color='', sim='')
+    phone = Product(brand='Apple', model='iPhone 17 Pro 256 Orange (1Sim+eSim)',
+                    category='Смартфоны', memory='', color='', sim='SIM + eSIM')
+    assert publisher._display_name(watch) == 'Apple Watch S11 46 Rose Gold(S/M)'
+    assert publisher._display_name(phone) == 'Apple iPhone 17 Pro 256 Orange (1Sim+eSim)'
+
+
+def test_watch_and_different_iphone_models_are_separate_posts():
+    engine, factory, bot = fixture()
+    with factory() as db:
+        extra = [('Apple Watch S11 46 Rose Gold(S/M)', 'Умные часы', ''),
+                 ('iPhone 17 Air 512 Blue (eSIM)', 'Смартфоны', 'eSIM'),
+                 ('iPhone 17 Pro Max 256 Silver (eSIM)', 'Смартфоны', 'eSIM')]
+        for i, (model, category, sim) in enumerate(extra, 4):
+            db.add(Product(id=i, sku_key=str(i), brand='Apple', model=model, category=category,
+                           memory='', color='', sim=sim, approved=True, hidden=False))
+            db.add(Offer(product_id=i, supplier_id=1, cost=Decimal('90000'), confirmed_date='2026-11-03', active=True))
+        db.commit()
+        targets, members, _ = publisher._group_targets(db, create=True)
+        assert len(targets) == 4
+        assert len({members[1], members[4], members[5], members[6]}) == 4
+        assert 'Apple Watch S11' in targets[members[4]][2] and 'iPhone' not in targets[members[4]][2]
+        assert 'iPhone 17 Air' in targets[members[5]][2] and 'Pro Max' not in targets[members[5]][2]
+    engine.dispose()
+
+
 def test_failed_group_edit_never_deletes_originals_and_retries(monkeypatch):
     engine, factory, bot = fixture()
     bot.edit_message_text.side_effect = OSError('unavailable')

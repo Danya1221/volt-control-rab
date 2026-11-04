@@ -71,9 +71,12 @@ def publication_enabled(factory=None):
 
 def _display_name(p: Product) -> str:
     parts = []
-    for item in (p.brand, p.model, p.memory, p.color, p.sim):
+    model = re.sub(r'[\U0001F1E6-\U0001F1FF]{2}', '', p.model or '').strip()
+    for index, item in enumerate((p.brand, p.model, p.memory, p.color, p.sim)):
         item = re.sub(r'[\U0001F1E6-\U0001F1FF]{2}', '', item or '').strip()
-        if item and item == (p.sim or '').strip() and item in sim_configuration(p.model or ''):
+        if index == 0 and item and re.search(r'(?<!\w)' + re.escape(item) + r'(?!\w)', model, re.I):
+            continue
+        if index == 4 and item and item in sim_configuration(p.model or ''):
             continue
         if item and not re.search(r'(?<!\w)' + re.escape(item) + r'(?!\w)', ' '.join(parts), re.I):
             parts.append(item)
